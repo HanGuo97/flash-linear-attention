@@ -3,19 +3,21 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from einops import rearrange, repeat
 from transformers.activations import ACT2FN
 
-from fla.modules import FusedRMSNormSwishGate, RMSNorm, ShortConvolution
+from fla.layers.utils import get_unpad_data, index_first_axis, pad_input
+from fla.modules import FusedRMSNormGated, RMSNorm, ShortConvolution
 from fla.modules.rotary import RotaryEmbedding
-from fla.ops.retention import (chunk_retention, fused_chunk_retention,
-                               fused_recurrent_retention, parallel_retention)
+from fla.ops.retention import chunk_retention, fused_chunk_retention, fused_recurrent_retention, parallel_retention
 
 if TYPE_CHECKING:
+    from transformers.processing_utils import Unpack
+
     from fla.models.utils import Cache
 
 
@@ -27,7 +29,7 @@ class MultiScaleRetention(nn.Module):
         mode (str, Optional):
             Which Retention kernel to use.
             Currently available: `chunk`, `fused_recurrent`, `parallel`, and `fused_chunk`.
-            Default: `fused_chunk`.
+            Default: `chunk`.
         hidden_size (int, Optional):
             The hidden size of the input. Default: 1024.
         expand_k (float, Optional):
@@ -124,11 +126,19 @@ class MultiScaleRetention(nn.Module):
         self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
 
         if gate_fn == 'swish' and fuse_norm and use_output_gate:
-            self.g_norm_swish_gate = FusedRMSNormSwishGate(self.head_v_dim, elementwise_affine, norm_eps)
+            self.g_norm_swish_gate = FusedRMSNormGated(
+                hidden_size=self.head_v_dim,
+                elementwise_affine=elementwise_affine,
+                eps=norm_eps
+            )
             self.fuse_norm_and_gate = True
         else:
             self.fuse_norm_and_gate = False
-            self.g_norm = RMSNorm(hidden_size=self.head_v_dim, elementwise_affine=elementwise_affine, eps=norm_eps)
+            self.g_norm = RMSNorm(
+                hidden_size=self.head_v_dim,
+                elementwise_affine=elementwise_affine,
+                eps=norm_eps
+            )
             self.gate_fn = ACT2FN[gate_fn]
 
         # TODO: fix this issue
@@ -144,7 +154,7 @@ class MultiScaleRetention(nn.Module):
         past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
-        **kwargs
+        **kwargs: Unpack[Dict]
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
         if attention_mask is not None:
             assert len(attention_mask.shape) == 2, (
@@ -153,63 +163,67 @@ class MultiScaleRetention(nn.Module):
                 "Arbitrary attention masks of shape [batch_size, seq_len, seq_len] are not allowed."
             )
 
-        # launching the triton kernel for just one token will actually be slower
-        mode = 'fused_recurrent' if hidden_states.shape[1] <= 64 else self.mode
+        batch_size, q_len, _ = hidden_states.shape
+        mode = 'fused_recurrent' if q_len <= 64 else self.mode
 
         last_state = None
         if past_key_values is not None and len(past_key_values) > self.layer_idx:
             last_state = past_key_values[self.layer_idx]
 
+        cu_seqlens = kwargs.get('cu_seqlens', None)
+        if attention_mask is not None:
+            indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])
+            hidden_states = index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices).unsqueeze(0)
+
         if self.use_short_conv:
             conv_state_q, conv_state_k, conv_state_v = None, None, None
             if last_state is not None:
                 conv_state_q, conv_state_k, conv_state_v = last_state['conv_state']
-            conv_mask = attention_mask[:, -hidden_states.shape[1]:] if attention_mask is not None else None
-            position_ids = kwargs.get('position_ids', None)
-            q, conv_state_q = self.q_conv1d(x=self.q_proj(hidden_states),
-                                            mask=conv_mask,
-                                            cache=conv_state_q,
-                                            output_final_state=use_cache,
-                                            seq_idx=position_ids)
-            k, conv_state_k = self.k_conv1d(x=self.k_proj(hidden_states),
-                                            mask=conv_mask,
-                                            cache=conv_state_k,
-                                            output_final_state=use_cache,
-                                            seq_idx=position_ids)
-            v, conv_state_v = self.v_conv1d(x=self.v_proj(hidden_states),
-                                            mask=conv_mask,
-                                            cache=conv_state_v,
-                                            output_final_state=use_cache,
-                                            seq_idx=position_ids)
+            q, conv_state_q = self.q_conv1d(
+                x=self.q_proj(hidden_states),
+                cache=conv_state_q,
+                output_final_state=use_cache,
+                cu_seqlens=cu_seqlens
+            )
+            k, conv_state_k = self.k_conv1d(
+                x=self.k_proj(hidden_states),
+                cache=conv_state_k,
+                output_final_state=use_cache,
+                cu_seqlens=cu_seqlens
+            )
+            v, conv_state_v = self.v_conv1d(
+                x=self.v_proj(hidden_states),
+                cache=conv_state_v,
+                output_final_state=use_cache,
+                cu_seqlens=cu_seqlens
+            )
         else:
             q = self.q_proj(hidden_states)
             k = self.k_proj(hidden_states)
             v = self.v_proj(hidden_states)
 
-        # dealing with left-padding
-        if attention_mask is not None:
-            v = v.mul_(attention_mask[:, -v.shape[-2]:, None])
         q = rearrange(q, '... (h d) -> ... h d', d=self.head_k_dim)
         k = rearrange(k, '... (h d) -> ... h d', d=self.head_k_dim)
         if self.feature_map_fn is not None:
             q, k = map(self.feature_map_fn, (q, k))
 
-        seqlen_offset, max_seqlen = 0, q.shape[1]
+        seqlen_offset, max_seqlen = 0, q_len
         if past_key_values is not None:
             seqlen_offset = past_key_values.get_seq_length(self.layer_idx)
-            max_seqlen = q.shape[1] + seqlen_offset
+            max_seqlen = q_len + seqlen_offset
 
-            if attention_mask is not None:
+            if attention_mask is not None and seqlen_offset > 0:
                 # to deliminate the offsets of padding tokens
-                seqlen_offset = (seqlen_offset + attention_mask.sum(-1) - attention_mask.shape[-1]).clamp(min=0)
-                max_seqlen = q.shape[1] + max(seqlen_offset)
+                seqlen_offset = attention_mask.sum(-1) - q_len
+                max_seqlen = q_len + seqlen_offset.max().item()
 
-        q, k = self.rotary(q, k, seqlen_offset=seqlen_offset, max_seqlen=max_seqlen)
+        q, k = self.rotary(q, k, seqlen_offset=seqlen_offset, max_seqlen=max_seqlen, cu_seqlens=cu_seqlens)
+
         if self.num_kv_groups > 1:
-            k = repeat(k, 'b t h d -> b t (h g) d', g=self.num_kv_groups)
-            v = repeat(v, 'b t (h d) -> b t (h g) d', d=self.head_v_dim, g=self.num_kv_groups)
+            k = repeat(k, '... h d -> ... (h g) d', g=self.num_kv_groups)
+            v = repeat(v, '... (h d) -> ... (h g) d', d=self.head_v_dim, g=self.num_kv_groups)
         else:
-            v = rearrange(v, 'b t (h d) -> b t h d', d=self.head_v_dim)
+            v = rearrange(v, '... (h d) -> ... h d', d=self.head_v_dim)
 
         recurrent_state = last_state['recurrent_state'] if last_state is not None else None
         if mode == 'chunk':
@@ -219,7 +233,7 @@ class MultiScaleRetention(nn.Module):
                 v=v,
                 initial_state=recurrent_state,
                 output_final_state=use_cache,
-                head_first=False
+                cu_seqlens=cu_seqlens,
             )
         elif mode == 'fused_chunk':
             o, recurrent_state = fused_chunk_retention(
@@ -228,10 +242,15 @@ class MultiScaleRetention(nn.Module):
                 v=v,
                 initial_state=recurrent_state,
                 output_final_state=use_cache,
-                head_first=False
+                cu_seqlens=cu_seqlens,
             )
         elif mode == 'parallel':
-            o, recurrent_state = parallel_retention(q, k, v, head_first=False)
+            o, recurrent_state = parallel_retention(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens=cu_seqlens,
+            )
         elif mode == 'fused_recurrent':
             o, recurrent_state = fused_recurrent_retention(
                 q=q,
@@ -239,7 +258,7 @@ class MultiScaleRetention(nn.Module):
                 v=v,
                 initial_state=recurrent_state,
                 output_final_state=use_cache,
-                head_first=False
+                cu_seqlens=cu_seqlens,
             )
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
@@ -249,27 +268,22 @@ class MultiScaleRetention(nn.Module):
                 recurrent_state=recurrent_state,
                 conv_state=(conv_state_q, conv_state_k, conv_state_v) if self.use_short_conv else None,
                 layer_idx=self.layer_idx,
-                offset=q.shape[1]
+                offset=q_len
             )
 
         if self.use_output_gate:
             g = self.g_proj(hidden_states)
             if self.fuse_norm_and_gate:
-                g = rearrange(g, 'b t (h d) -> b t h d', d=self.head_v_dim)
+                g = rearrange(g, '... (h d) -> ... h d', d=self.head_v_dim)
                 o = self.g_norm_swish_gate(o, g)
-                o = rearrange(o, 'b t h d -> b t (h d)')
+                o = rearrange(o, '... h d -> ... (h d)')
             else:
-                o = rearrange(self.g_norm(o), 'b t h d -> b t (h d)')
+                o = rearrange(self.g_norm(o), '... h d -> ... (h d)')
                 o = o * self.gate_fn(g)
         else:
-            o = rearrange(self.g_norm(o), 'b t h d -> b t (h d)')
+            o = rearrange(self.g_norm(o), '... h d -> ... (h d)')
         o = self.o_proj(o)
+        if attention_mask is not None:
+            o = pad_input(o.squeeze(0), indices, batch_size, q_len)
 
         return o, None, past_key_values
-
-    def state_size(self, **kwargs) -> int:
-        state_size = self.key_dim * self.head_v_dim
-        for module in self.children():
-            if isinstance(module, ShortConvolution):
-                state_size += module.state_size
-        return state_size

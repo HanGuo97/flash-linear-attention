@@ -6,7 +6,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
+from fla.ops.utils.op import exp, log
+from fla.utils import autocast_custom_bwd, autocast_custom_fwd, get_multiprocessor_count, input_guard
 
 sigmoid_fwd_codestring = """
 template <typename T> T sigmoid_fwd(T x) {
@@ -72,8 +73,8 @@ def logsigmoid_fwd_kernel(
 
     b_x = tl.load(x + o_i, mask=m_i, other=0.).to(tl.float32)
     b_m = tl.minimum(0., b_x)
-    b_z = 1. + tl.exp(-tl.abs(b_x))
-    b_y = (b_m - tl.log(b_z)) / temperature
+    b_z = 1. + exp(-tl.abs(b_x))
+    b_y = (b_m - log(b_z)) / temperature
     tl.store(y + o_i, b_y.to(y.dtype.element_ty), mask=m_i)
 
 
@@ -106,7 +107,7 @@ def logsigmoid_bwd_kernel(
 
 def logsigmoid_fwd(x: torch.Tensor, temperature: float = 1.) -> torch.Tensor:
     T, D = x.numel(), x.shape[-1]
-    B = triton.next_power_of_2(triton.cdiv(T, torch.cuda.get_device_properties(x.device).multi_processor_count))
+    B = triton.next_power_of_2(triton.cdiv(T, get_multiprocessor_count(x.device.index)))
     y = torch.empty_like(x)
     logsigmoid_fwd_kernel[(triton.cdiv(T, B),)](
         x=x,
@@ -121,7 +122,7 @@ def logsigmoid_fwd(x: torch.Tensor, temperature: float = 1.) -> torch.Tensor:
 
 def logsigmoid_bwd(x: torch.Tensor, dy: torch.Tensor, temperature: float = 1.) -> torch.Tensor:
     T, D = x.numel(), x.shape[-1]
-    B = triton.next_power_of_2(triton.cdiv(T, torch.cuda.get_device_properties(x.device).multi_processor_count))
+    B = triton.next_power_of_2(triton.cdiv(T, get_multiprocessor_count(x.device.index)))
     dx = torch.empty_like(x)
     logsigmoid_bwd_kernel[(triton.cdiv(T, B),)](
         x=x,

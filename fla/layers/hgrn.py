@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from fla.modules import FusedRMSNormSwishGate, ShortConvolution
+from fla.modules import FusedRMSNormGated, ShortConvolution
 from fla.modules.activations import swiglu
 from fla.ops.hgrn import chunk_hgrn, fused_recurrent_hgrn
 
@@ -60,7 +60,11 @@ class HGRNAttention(nn.Module):
             self.f_conv1d = ShortConvolution(self.input_dim, conv_size, activation=None)
             self.i_conv1d = ShortConvolution(self.input_dim, conv_size, activation=None)
 
-        self.g_norm = FusedRMSNormSwishGate(self.input_dim, elementwise_affine, norm_eps)
+        self.g_norm = FusedRMSNormGated(
+            hidden_size=self.input_dim,
+            elementwise_affine=elementwise_affine,
+            eps=norm_eps
+        )
         self.o_proj = nn.Linear(self.input_dim, hidden_size, bias=False)
 
     def forward(
@@ -87,22 +91,26 @@ class HGRNAttention(nn.Module):
         if past_key_values is not None and len(past_key_values) > self.layer_idx:
             last_state = past_key_values[self.layer_idx]
 
+        cu_seqlens = kwargs.get('cu_seqlens', None)
         if self.use_short_conv:
             conv_state_i, conv_state_f = None, None
             if last_state is not None:
                 conv_state_i, conv_state_f = last_state['conv_state']
             conv_mask = attention_mask[:, -hidden_states.shape[1]:] if attention_mask is not None else None
-            position_ids = kwargs.get('position_ids', None)
-            i, conv_state_i = self.i_conv1d(x=self.i_proj(hidden_states),
-                                            mask=conv_mask,
-                                            cache=conv_state_i,
-                                            output_final_state=use_cache,
-                                            seq_idx=position_ids)
-            f, conv_state_f = self.f_conv1d(x=self.f_proj(hidden_states),
-                                            mask=conv_mask,
-                                            cache=conv_state_f,
-                                            output_final_state=use_cache,
-                                            seq_idx=position_ids)
+            i, conv_state_i = self.i_conv1d(
+                x=self.i_proj(hidden_states),
+                mask=conv_mask,
+                cache=conv_state_i,
+                output_final_state=use_cache,
+                cu_seqlens=cu_seqlens
+            )
+            f, conv_state_f = self.f_conv1d(
+                x=self.f_proj(hidden_states),
+                mask=conv_mask,
+                cache=conv_state_f,
+                output_final_state=use_cache,
+                cu_seqlens=cu_seqlens
+            )
         else:
             i = self.i_proj(hidden_states)
             f = self.f_proj(hidden_states)
@@ -120,10 +128,22 @@ class HGRNAttention(nn.Module):
 
         recurrent_state = last_state['recurrent_state'] if last_state is not None else None
         if mode == 'chunk':
-            o, recurrent_state = chunk_hgrn(i, f, recurrent_state, use_cache)
+            if cu_seqlens is not None:
+                raise NotImplementedError("Chunk mode does not support variable-length sequences.")
+            o, recurrent_state = chunk_hgrn(
+                x=i,
+                g=f,
+                initial_state=recurrent_state,
+                output_final_state=use_cache,
+            )
         elif mode == 'fused_recurrent':
-            o, recurrent_state = fused_recurrent_hgrn(i, f, recurrent_state, use_cache,
-                                                      cu_seqlens=kwargs.get('cu_seqlens', None))
+            o, recurrent_state = fused_recurrent_hgrn(
+                x=i,
+                g=f,
+                initial_state=recurrent_state,
+                output_final_state=use_cache,
+                cu_seqlens=cu_seqlens
+            )
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
 

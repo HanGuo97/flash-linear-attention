@@ -1,6 +1,5 @@
 # test file
 test.py
-mingpt
 
 # data files
 data
@@ -29,8 +28,6 @@ log.*
 *.log
 *.cfg
 *.ini
-*.yml
-*.yaml
 
 # pycache
 __pycache__
@@ -39,8 +36,6 @@ __pycache__
 *.pkl
 *.pt
 
-# hidden files
-.*
 
 # vscode
 .vscode

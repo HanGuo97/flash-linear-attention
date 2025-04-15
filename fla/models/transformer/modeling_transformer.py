@@ -10,8 +10,7 @@ import torch
 import torch.nn as nn
 import torch.utils.checkpoint
 from transformers.generation import GenerationMixin
-from transformers.modeling_outputs import (BaseModelOutputWithPast,
-                                           CausalLMOutputWithPast)
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 from transformers.utils.deprecation import deprecate_kwarg
@@ -44,6 +43,7 @@ class TransformerBlock(nn.Module):
             num_heads=config.num_heads,
             num_kv_heads=config.num_kv_heads,
             qkv_bias=config.qkv_bias,
+            qk_norm=config.qk_norm,
             window_size=config.window_size,
             rope_theta=config.rope_theta,
             max_position_embeddings=config.max_position_embeddings,
