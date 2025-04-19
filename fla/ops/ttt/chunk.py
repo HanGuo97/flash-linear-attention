@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang, Yuqi Pan
 
+import warnings
 from typing import Optional, Tuple
 
 import torch
@@ -51,7 +52,6 @@ def chunk_ttt_linear_fwd_kernel_h(
     BT: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
-    NT: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     USE_INITIAL_STATE_B: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr,
@@ -729,7 +729,6 @@ def chunk_ttt_linear_fwd_h(
         BT=BT,
         BK=BK,
         BV=BV,
-        NT=NT,
     )
     return h, hb, v_new, final_state, final_state_bias
 
@@ -1403,6 +1402,13 @@ def chunk_ttt_linear(
             "Please use head_first=False for now instead."
         )
         q, k, v, eta = map(lambda x: rearrange(x, 'b h t ... -> b t h ...'), (q, k, v, eta))
+    if not head_first and q.shape[1] < q.shape[2]:
+        warnings.warn(
+            f"Input tensor shape suggests potential format mismatch: seq_len ({q.shape[1]}) < num_heads ({q.shape[2]}). "
+            "This may indicate the inputs were passed in head-first format [B, H, T, ...] "
+            "when head_first=False was specified. "
+            "Please verify your input tensor format matches the expected shape [B, T, H, ...]."
+        )
     if cu_seqlens is not None:
         if q.shape[0] != 1:
             raise ValueError(
